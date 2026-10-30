@@ -37,6 +37,7 @@ let sock = null;
 let reconnectTimer = null;
 let isShuttingDown = false;
 let reconnecting = false;
+let sessionReplaced = false;
 
 function fixBuffer(value) {
   if (!value || typeof value !== 'object') return value;
@@ -181,6 +182,8 @@ async function connectSession() {
     syncFullHistory: false
   });
 
+  sock = socket;
+
   socket.ev.on('creds.update', updates => {
     Object.assign(auth.creds, updates);
   });
@@ -196,6 +199,8 @@ async function connectSession() {
 
     if (connection !== 'close') return;
 
+    if (sock !== socket) return;
+
     const error = lastDisconnect?.error;
     const code = getDisconnectCode(error);
 
@@ -207,11 +212,18 @@ async function connectSession() {
       '⚠ WhatsApp connection closed'
     );
 
-    if (sock === socket) {
-      sock = null;
-    }
+    sock = null;
 
     if (isShuttingDown) return;
+
+    if (code === DisconnectReason.connectionReplaced) {
+      sessionReplaced = true;
+      reconnecting = false;
+      logger.error(
+        '❌ WhatsApp session was replaced by another connection. Stop the other client and restart this service.'
+      );
+      return;
+    }
 
     if (code === DisconnectReason.loggedOut) {
       logger.error(
@@ -253,7 +265,14 @@ async function connectSession() {
 }
 
 function scheduleReconnect() {
-  if (isShuttingDown || reconnectTimer || reconnecting) return;
+  if (
+    isShuttingDown ||
+    sessionReplaced ||
+    reconnectTimer ||
+    reconnecting
+  ) {
+    return;
+  }
 
   reconnecting = true;
 
@@ -316,7 +335,7 @@ async function forwardMessage(number, message) {
 }
 
 async function boot() {
-  if (isShuttingDown || sock) return;
+  if (isShuttingDown || sessionReplaced || sock) return;
 
   try {
     sock = await connectSession();
