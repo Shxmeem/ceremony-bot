@@ -236,95 +236,23 @@ async function connectSession() {
   });
 
   socket.ev.on('messages.upsert', async ({ type, messages }) => {
-    logger.info(
-      {
-        type,
-        count: Array.isArray(messages) ? messages.length : 0
-      },
-      '📥 messages.upsert event received'
-    );
-
-    if (type !== 'notify') {
-      logger.info(
-        { type },
-        'Skipping messages.upsert: type is not "notify"'
-      );
-      return;
-    }
+    if (type !== 'notify') return;
 
     for (const msg of messages) {
       try {
-        logger.info(
-          {
-            fromMe: msg.key?.fromMe,
-            remoteJid: msg.key?.remoteJid,
-            id: msg.key?.id,
-            hasMessage: Boolean(msg.message)
-          },
-          '🔎 Processing incoming message'
-        );
-
-        if (!msg.message) {
-          logger.info(
-            { id: msg.key?.id },
-            'Skipping message: no msg.message content'
-          );
-          continue;
-        }
-
-        if (msg.key.fromMe) {
-          logger.info(
-            { id: msg.key?.id },
-            'Skipping message: fromMe is true'
-          );
-          continue;
-        }
+        if (!msg.message || msg.key.fromMe) continue;
 
         const from = msg.key.remoteJid || '';
 
-        logger.info(
-          { from },
-          'Evaluating remoteJid'
-        );
-
-        if (from === 'status@broadcast') {
-          logger.info(
-            { from },
-            'Skipping message: status@broadcast'
-          );
-          continue;
-        }
-
-        if (!from.endsWith('@s.whatsapp.net')) {
-          logger.info(
-            { from },
-            'Skipping message: remoteJid is not @s.whatsapp.net'
-          );
+        if (
+          from === 'status@broadcast' ||
+          !from.endsWith('@s.whatsapp.net')
+        ) {
           continue;
         }
 
         const text = extractText(msg.message);
-
-        if (!text) {
-          logger.info(
-            {
-              from,
-              messageKeys: Object.keys(msg.message || {})
-            },
-            'Skipping message: no extractable text'
-          );
-          continue;
-        }
-
-        logger.info(
-          {
-            from,
-            number: from.split('@')[0],
-            textPreview: text.length > 100 ? `${text.slice(0, 100)}...` : text,
-            textLength: text.length
-          },
-          '📨 Forwarding message to webhook'
-        );
+        if (!text) continue;
 
         await forwardMessage(from.split('@')[0], text);
       } catch (error) {
@@ -378,65 +306,16 @@ function extractText(message) {
 async function forwardMessage(number, message) {
   const url = FORWARD_URL.replace(/\/$/, '') + FORWARD_PATH;
 
-  logger.info(
-    {
-      url,
-      number,
-      method: 'POST',
-      hasOtpToken: Boolean(OTP_TOKEN),
-      messageLength: message.length
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(OTP_TOKEN ? { 'X-Qxel-Secret-Key': OTP_TOKEN } : {})
     },
-    '📤 Sending POST request to webhook'
-  );
-
-  let response;
-
-  try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(OTP_TOKEN ? { 'X-Qxel-Secret-Key': OTP_TOKEN } : {})
-      },
-      body: JSON.stringify({ number, message })
-    });
-  } catch (error) {
-    logger.error(
-      {
-        url,
-        number,
-        err: error,
-        cause: error?.cause,
-        message: error?.message
-      },
-      '❌ Webhook fetch threw an exception'
-    );
-    return;
-  }
-
-  logger.info(
-    {
-      url,
-      number,
-      status: response.status,
-      statusText: response.statusText,
-      ok: response.ok
-    },
-    '📬 Webhook response received'
-  );
+    body: JSON.stringify({ number, message })
+  });
 
   const body = await response.text();
-
-  logger.info(
-    {
-      url,
-      number,
-      status: response.status,
-      responseBody: body.length > 500 ? `${body.slice(0, 500)}...` : body,
-      responseBodyLength: body.length
-    },
-    '📄 Webhook response body'
-  );
 
   if (!response.ok) {
     logger.error(
