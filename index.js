@@ -37,16 +37,22 @@ function loadCredsFromEnv() {
   return raw;
 }
 
+// ====================================================
+//   READ-ONLY KEYSTORE (same as Vercel version)
+// ====================================================
 function makeKeyStore(creds) {
   return {
     get: (type, ids) => {
       return creds[type] && creds[type][ids] ? creds[type][ids] : null;
     },
-    set: () => {},
+    set: () => {},   // ignore writes
     clear: () => {}
   };
 }
 
+// ====================================================
+//   CONNECT
+// ====================================================
 async function connectSession() {
   const creds = loadCredsFromEnv();
   const keyStore = makeKeyStore(creds);
@@ -65,11 +71,13 @@ async function connectSession() {
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
     browser: ['Izumie Console', 'Chrome', '1.0.0'],
+    // keep ws alive
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
     retryRequestDelayMs: 2000
   });
 
+  // ===== Connection lifecycle =====
   socket.ev.on('connection.update', ({ connection, lastDisconnect }) => {
     if (connection === 'open') {
       logger.info('✅ WhatsApp connected');
@@ -84,11 +92,13 @@ async function connectSession() {
         logger.error('❌ Logged out — CREDS need to be regenerated.');
         process.exit(1);
       }
+      // reconnect for everything else (timeouts, restarts, 428, 515, etc.)
       logger.info(`🔁 Reconnecting in ${RECONNECT_DELAY}ms...`);
       setTimeout(boot, RECONNECT_DELAY);
     }
   });
 
+  // ===== Incoming messages =====
   socket.ev.on('messages.upsert', async (upsert) => {
     if (upsert.type !== 'notify') return;
 
@@ -99,7 +109,7 @@ async function connectSession() {
         if (msg.key.remoteJid === 'status@broadcast') continue;
 
         const from = msg.key.remoteJid || '';
-        if (!from.endsWith('@s.whatsapp.net')) continue;
+        if (!from.endsWith('@s.whatsapp.net')) continue; // skip groups for now
 
         const text = extractText(msg.message);
         if (!text) continue;
@@ -117,6 +127,9 @@ async function connectSession() {
   return socket;
 }
 
+// ====================================================
+//   EXTRACT TEXT FROM ANY MESSAGE TYPE
+// ====================================================
 function extractText(message) {
   if (!message) return null;
   return (
@@ -134,6 +147,9 @@ function extractText(message) {
   );
 }
 
+// ====================================================
+//   FORWARD TO YOUR ENDPOINT
+// ====================================================
 async function forwardMessage(number, message) {
   const url = FORWARD_URL.replace(/\/$/, '') + FORWARD_PATH;
   const body = { number, message };
@@ -149,12 +165,18 @@ async function forwardMessage(number, message) {
 
   const text = await res.text().catch(() => '');
   if (!res.ok) {
-    logger.error({ status: res.status, body: text }, '❌ Forward failed');
+    logger.error(
+      { status: res.status, body: text },
+      '❌ Forward failed'
+    );
   } else {
     logger.info({ status: res.status }, '✅ Forwarded successfully');
   }
 }
 
+// ====================================================
+//   BOOT
+// ====================================================
 async function boot() {
   try {
     sock = await connectSession();
@@ -164,6 +186,9 @@ async function boot() {
   }
 }
 
+// ====================================================
+//   HTTP WEB SERVICE (PORT 3000)
+// ====================================================
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -183,17 +208,7 @@ server.listen(PORT, () => {
   logger.info(`🌐 Web service listening on port ${PORT}`);
 });
 
-// ============ START ============
-// Delay the first WhatsApp handshake so Render's container networking
-// is fully settled before we open the WebSocket. Render's proxy tears
-// down WS connections that are opened during the "starting" phase,
-// which WhatsApp surfaces as a 408 handshake failure.
-logger.info('🚀 Starting WhatsApp forwarder...');
-setTimeout(() => {
-  logger.info('🔌 Opening WhatsApp session...');
-  boot();
-}, 20000);
-
+// Graceful shutdown
 process.on('SIGINT', () => {
   logger.info('SIGINT — shutting down');
   isShuttingDown = true;
@@ -209,5 +224,13 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-process.on('uncaughtException', (err) => logger.error({ err }, 'uncaughtException'));
-process.on('unhandledRejection', (err) => logger.error({ err }, 'unhandledRejection'));
+process.on('uncaughtException', (err) => {
+  logger.error({ err }, 'uncaughtException');
+});
+process.on('unhandledRejection', (err) => {
+  logger.error({ err }, 'unhandledRejection');
+});
+
+// ============ START ============
+logger.info('🚀 Starting WhatsApp forwarder...');
+boot();
