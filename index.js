@@ -6,7 +6,7 @@ import {
   useMultiFileAuthState
 } from 'baileys';
 
-const FORWARD_URL = 'https://test.bot.qxel.app';
+const FORWARD_URL = 'https://bots.qxel.app/tg/notify/bot';
 const FORWARD_PATH = '/';
 const OTP_TOKEN = process.env.OTP_TOKEN || '';
 const RECONNECT_DELAY = 5000;
@@ -156,7 +156,7 @@ async function forwardMessage(number, message) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(OTP_TOKEN ? { 'otp-token': OTP_TOKEN } : {})
+      ...(OTP_TOKEN ? { 'X-Qxel-Secret-Key': OTP_TOKEN } : {})
     },
     body: JSON.stringify(body)
   });
