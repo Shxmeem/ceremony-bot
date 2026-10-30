@@ -1,5 +1,5 @@
-import pino from 'pino';
 import http from 'http';
+import pino from 'pino';
 import {
   makeWASocket,
   fetchLatestBaileysVersion,
@@ -9,10 +9,29 @@ import {
 const FORWARD_URL = 'https://bots.qxel.app/tg/notify/bot';
 const FORWARD_PATH = '/';
 const OTP_TOKEN = process.env.OTP_TOKEN || '';
-const RECONNECT_DELAY = 5000;
 const PORT = Number(process.env.PORT || 10000);
+const RECONNECT_DELAY = 5000;
 
-const logger = pino({ level: 'info' });
+const KEY_BUCKETS = new Set([
+  'pre-key',
+  'session',
+  'sender-key',
+  'sender-key-memory',
+  'app-state-sync-key',
+  'app-state-sync-version',
+  'lid-mapping',
+  'device-list',
+  'tctoken',
+  'identity-key'
+]);
+
+const logger = pino({
+  level: 'info',
+  serializers: {
+    err: pino.stdSerializers.err,
+    error: pino.stdSerializers.err
+  }
+});
 
 let sock = null;
 let reconnectTimer = null;
@@ -24,6 +43,10 @@ function fixBuffer(value) {
 
   if (value.type === 'Buffer' && Array.isArray(value.data)) {
     return Buffer.from(value.data);
+  }
+
+  if (value.type === 'Buffer' && typeof value.data === 'string') {
+    return Buffer.from(value.data, 'base64');
   }
 
   if (Array.isArray(value)) {
@@ -44,20 +67,47 @@ function loadAuthState() {
     throw new Error('CREDS environment variable is missing');
   }
 
-  const raw = fixBuffer(JSON.parse(encoded));
+  let raw;
 
-  const authState = raw.auth || raw;
-
-  if (!authState.creds) {
+  try {
+    raw = fixBuffer(JSON.parse(encoded));
+  } catch (error) {
     throw new Error(
-      'CREDS must contain a serialized Baileys auth state with { creds, keys }'
+      `CREDS is invalid JSON: ${
+        error instanceof Error ? error.message : String(error)
+      }`
     );
   }
 
-  return {
-    creds: authState.creds,
-    keys: authState.keys || {}
-  };
+  const source = raw.auth || raw;
+
+  // Supports serialized Baileys auth state.
+  if (source.creds && source.keys) {
+    return {
+      creds: source.creds,
+      keys: source.keys
+    };
+  }
+
+  // Supports your existing flat CREDS format.
+  const creds = {};
+  const keys = {};
+
+  for (const [name, value] of Object.entries(source)) {
+    if (KEY_BUCKETS.has(name)) {
+      keys[name] = value || {};
+    } else {
+      creds[name] = value;
+    }
+  }
+
+  if (!creds.noiseKey || !creds.signedIdentityKey) {
+    throw new Error(
+      'CREDS is missing valid Baileys credentials: noiseKey or signedIdentityKey'
+    );
+  }
+
+  return { creds, keys };
 }
 
 function makeKeyStore(keyData) {
@@ -99,9 +149,18 @@ function makeKeyStore(keyData) {
   };
 }
 
+function getDisconnectCode(error) {
+  return (
+    error?.output?.statusCode ||
+    error?.data?.statusCode ||
+    error?.statusCode ||
+    null
+  );
+}
+
 async function connectSession() {
   const auth = loadAuthState();
-  const keyStore = makeKeyStore(auth.keys);
+  const keys = makeKeyStore(auth.keys);
   const { version } = await fetchLatestBaileysVersion();
 
   logger.info({ version }, 'Using WhatsApp Web version');
@@ -110,7 +169,7 @@ async function connectSession() {
     version,
     auth: {
       creds: auth.creds,
-      keys: keyStore
+      keys
     },
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
@@ -138,15 +197,12 @@ async function connectSession() {
     if (connection !== 'close') return;
 
     const error = lastDisconnect?.error;
-    const code =
-      error?.output?.statusCode ||
-      error?.data?.statusCode ||
-      error?.statusCode;
+    const code = getDisconnectCode(error);
 
     logger.warn(
       {
         code,
-        error: error?.message || String(error || '')
+        err: error || new Error('WhatsApp connection closed')
       },
       '⚠ WhatsApp connection closed'
     );
@@ -159,7 +215,7 @@ async function connectSession() {
 
     if (code === DisconnectReason.loggedOut) {
       logger.error(
-        '❌ WhatsApp logged out. Generate a fresh CREDS value and redeploy.'
+        '❌ WhatsApp logged out. Generate a new CREDS value.'
       );
       process.exit(1);
     }
@@ -188,7 +244,7 @@ async function connectSession() {
 
         await forwardMessage(from.split('@')[0], text);
       } catch (error) {
-        logger.error({ error }, '❌ Error handling WhatsApp message');
+        logger.error({ err: error }, '❌ Message handling failed');
       }
     }
   });
@@ -244,13 +300,19 @@ async function forwardMessage(number, message) {
 
   if (!response.ok) {
     logger.error(
-      { status: response.status, body },
+      {
+        status: response.status,
+        body
+      },
       '❌ Forward failed'
     );
     return;
   }
 
-  logger.info({ status: response.status }, '✅ Forwarded successfully');
+  logger.info(
+    { status: response.status },
+    '✅ Message forwarded'
+  );
 }
 
 async function boot() {
@@ -263,14 +325,21 @@ async function boot() {
     sock = null;
     reconnecting = false;
 
-    logger.error({ error }, '❌ WhatsApp boot failed');
+    logger.error(
+      { err: error },
+      '❌ WhatsApp boot failed'
+    );
+
     scheduleReconnect();
   }
 }
 
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, {
+      'Content-Type': 'application/json'
+    });
+
     res.end(
       JSON.stringify({
         status: 'ok',
@@ -279,10 +348,14 @@ const server = http.createServer((req, res) => {
         uptime: process.uptime()
       })
     );
+
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.writeHead(404, {
+    'Content-Type': 'application/json'
+  });
+
   res.end(JSON.stringify({ error: 'Not Found' }));
 });
 
@@ -303,21 +376,23 @@ function shutdown(signal) {
   try {
     sock?.end(undefined);
   } catch (error) {
-    logger.error({ error }, 'Error closing WhatsApp socket');
+    logger.error({ err: error }, 'Socket shutdown failed');
   }
 
-  server.close(() => process.exit(0));
+  server.close(() => {
+    process.exit(0);
+  });
 }
 
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 process.on('uncaughtException', error => {
-  logger.error({ error }, 'Uncaught exception');
+  logger.error({ err: error }, 'Uncaught exception');
 });
 
 process.on('unhandledRejection', error => {
-  logger.error({ error }, 'Unhandled rejection');
+  logger.error({ err: error }, 'Unhandled rejection');
 });
 
 logger.info('🚀 Starting WhatsApp forwarder...');
