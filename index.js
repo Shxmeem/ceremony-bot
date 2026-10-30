@@ -1,4 +1,5 @@
 import pino from 'pino';
+import http from 'http';
 import {
   makeWASocket,
   fetchLatestBaileysVersion,
@@ -10,6 +11,7 @@ const FORWARD_URL = 'https://bots.qxel.app/tg/notify/bot';
 const FORWARD_PATH = '/';
 const OTP_TOKEN = process.env.OTP_TOKEN || '';
 const RECONNECT_DELAY = 5000;
+const PORT = process.env.PORT || 3000;
 
 const logger = pino({ level: 'info' });
 
@@ -184,17 +186,41 @@ async function boot() {
   }
 }
 
+// ====================================================
+//   HTTP WEB SERVICE (PORT 3000)
+// ====================================================
+const server = http.createServer((req, res) => {
+  if (req.url === '/' || req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      service: 'whatsapp-forwarder',
+      connected: !!sock,
+      uptime: process.uptime()
+    }));
+    return;
+  }
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not Found' }));
+});
+
+server.listen(PORT, () => {
+  logger.info(`🌐 Web service listening on port ${PORT}`);
+});
+
 // Graceful shutdown
 process.on('SIGINT', () => {
   logger.info('SIGINT — shutting down');
   isShuttingDown = true;
   try { sock?.end(undefined); } catch {}
+  try { server.close(); } catch {}
   process.exit(0);
 });
 process.on('SIGTERM', () => {
   logger.info('SIGTERM — shutting down');
   isShuttingDown = true;
   try { sock?.end(undefined); } catch {}
+  try { server.close(); } catch {}
   process.exit(0);
 });
 
