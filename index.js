@@ -3,123 +3,192 @@ import http from 'http';
 import {
   makeWASocket,
   fetchLatestBaileysVersion,
-  DisconnectReason,
-  useMultiFileAuthState
+  DisconnectReason
 } from 'baileys';
 
 const FORWARD_URL = 'https://bots.qxel.app/tg/notify/bot';
 const FORWARD_PATH = '/';
 const OTP_TOKEN = process.env.OTP_TOKEN || '';
 const RECONNECT_DELAY = 5000;
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 10000);
 
 const logger = pino({ level: 'info' });
 
 let sock = null;
+let reconnectTimer = null;
 let isShuttingDown = false;
+let reconnecting = false;
 
-function fixBuffer(obj) {
-  if (obj && typeof obj === 'object') {
-    if (obj.type === 'Buffer' && Array.isArray(obj.data)) {
-      return Buffer.from(obj.data);
-    }
-    for (const key in obj) obj[key] = fixBuffer(obj[key]);
+function fixBuffer(value) {
+  if (!value || typeof value !== 'object') return value;
+
+  if (value.type === 'Buffer' && Array.isArray(value.data)) {
+    return Buffer.from(value.data);
   }
-  return obj;
+
+  if (Array.isArray(value)) {
+    return value.map(fixBuffer);
+  }
+
+  for (const key of Object.keys(value)) {
+    value[key] = fixBuffer(value[key]);
+  }
+
+  return value;
 }
 
-function loadCredsFromEnv() {
-  if (!process.env.CREDS) {
-    throw new Error('CREDS environment variable not found');
-  }
-  const raw = JSON.parse(process.env.CREDS);
-  fixBuffer(raw);
-  return raw;
-}
+function loadAuthState() {
+  const encoded = process.env.CREDS;
 
-// ====================================================
-//   READ-ONLY KEYSTORE (same as Vercel version)
-// ====================================================
-function makeKeyStore(creds) {
+  if (!encoded) {
+    throw new Error('CREDS environment variable is missing');
+  }
+
+  const raw = fixBuffer(JSON.parse(encoded));
+
+  const authState = raw.auth || raw;
+
+  if (!authState.creds) {
+    throw new Error(
+      'CREDS must contain a serialized Baileys auth state with { creds, keys }'
+    );
+  }
+
   return {
-    get: (type, ids) => {
-      return creds[type] && creds[type][ids] ? creds[type][ids] : null;
-    },
-    set: () => {},   // ignore writes
-    clear: () => {}
+    creds: authState.creds,
+    keys: authState.keys || {}
   };
 }
 
-// ====================================================
-//   CONNECT
-// ====================================================
-async function connectSession() {
-  const creds = loadCredsFromEnv();
-  const keyStore = makeKeyStore(creds);
+function makeKeyStore(keyData) {
+  const store = keyData || {};
 
+  return {
+    async get(type, ids) {
+      const bucket = store[type] || {};
+      const result = {};
+
+      for (const id of ids) {
+        if (bucket[id] !== undefined && bucket[id] !== null) {
+          result[id] = bucket[id];
+        }
+      }
+
+      return result;
+    },
+
+    async set(data) {
+      for (const [type, values] of Object.entries(data)) {
+        store[type] ||= {};
+
+        for (const [id, value] of Object.entries(values || {})) {
+          if (value === null || value === undefined) {
+            delete store[type][id];
+          } else {
+            store[type][id] = value;
+          }
+        }
+      }
+    },
+
+    async clear() {
+      for (const type of Object.keys(store)) {
+        delete store[type];
+      }
+    }
+  };
+}
+
+async function connectSession() {
+  const auth = loadAuthState();
+  const keyStore = makeKeyStore(auth.keys);
   const { version } = await fetchLatestBaileysVersion();
+
+  logger.info({ version }, 'Using WhatsApp Web version');
 
   const socket = makeWASocket({
     version,
     auth: {
-      creds,
-      keys: {
-        get: (...args) => keyStore.get(...args),
-        set: () => {}
-      }
+      creds: auth.creds,
+      keys: keyStore
     },
-    printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
+    printQRInTerminal: false,
     browser: ['Izumie Console', 'Chrome', '1.0.0'],
-    // keep ws alive
-    keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
-    retryRequestDelayMs: 2000
+    keepAliveIntervalMs: 25000,
+    retryRequestDelayMs: 2000,
+    markOnlineOnConnect: false,
+    syncFullHistory: false
   });
 
-  // ===== Connection lifecycle =====
-  socket.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+  socket.ev.on('creds.update', updates => {
+    Object.assign(auth.creds, updates);
+  });
+
+  socket.ev.on('connection.update', update => {
+    const { connection, lastDisconnect } = update;
+
     if (connection === 'open') {
+      reconnecting = false;
       logger.info('✅ WhatsApp connected');
-    } else if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      logger.warn({ code }, '⚠ Connection closed');
-      sock = null;
-
-      if (isShuttingDown) return;
-
-      if (code === DisconnectReason.loggedOut) {
-        logger.error('❌ Logged out — CREDS need to be regenerated.');
-        process.exit(1);
-      }
-      // reconnect for everything else (timeouts, restarts, 428, 515, etc.)
-      logger.info(`🔁 Reconnecting in ${RECONNECT_DELAY}ms...`);
-      setTimeout(boot, RECONNECT_DELAY);
+      return;
     }
+
+    if (connection !== 'close') return;
+
+    const error = lastDisconnect?.error;
+    const code =
+      error?.output?.statusCode ||
+      error?.data?.statusCode ||
+      error?.statusCode;
+
+    logger.warn(
+      {
+        code,
+        error: error?.message || String(error || '')
+      },
+      '⚠ WhatsApp connection closed'
+    );
+
+    if (sock === socket) {
+      sock = null;
+    }
+
+    if (isShuttingDown) return;
+
+    if (code === DisconnectReason.loggedOut) {
+      logger.error(
+        '❌ WhatsApp logged out. Generate a fresh CREDS value and redeploy.'
+      );
+      process.exit(1);
+    }
+
+    scheduleReconnect();
   });
 
-  // ===== Incoming messages =====
-  socket.ev.on('messages.upsert', async (upsert) => {
-    if (upsert.type !== 'notify') return;
+  socket.ev.on('messages.upsert', async ({ type, messages }) => {
+    if (type !== 'notify') return;
 
-    for (const msg of upsert.messages) {
+    for (const msg of messages) {
       try {
-        if (!msg.message) continue;
-        if (msg.key.fromMe) continue;
-        if (msg.key.remoteJid === 'status@broadcast') continue;
+        if (!msg.message || msg.key.fromMe) continue;
 
         const from = msg.key.remoteJid || '';
-        if (!from.endsWith('@s.whatsapp.net')) continue; // skip groups for now
+
+        if (
+          from === 'status@broadcast' ||
+          !from.endsWith('@s.whatsapp.net')
+        ) {
+          continue;
+        }
 
         const text = extractText(msg.message);
         if (!text) continue;
 
-        const number = from.split('@')[0];
-        logger.info({ number, text }, '📩 Forwarding incoming message');
-
-        await forwardMessage(number, text);
-      } catch (err) {
-        logger.error({ err }, '❌ Error handling message');
+        await forwardMessage(from.split('@')[0], text);
+      } catch (error) {
+        logger.error({ error }, '❌ Error handling WhatsApp message');
       }
     }
   });
@@ -127,11 +196,23 @@ async function connectSession() {
   return socket;
 }
 
-// ====================================================
-//   EXTRACT TEXT FROM ANY MESSAGE TYPE
-// ====================================================
+function scheduleReconnect() {
+  if (isShuttingDown || reconnectTimer || reconnecting) return;
+
+  reconnecting = true;
+
+  logger.info(
+    { delay: RECONNECT_DELAY },
+    '🔁 Reconnecting to WhatsApp'
+  );
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    boot();
+  }, RECONNECT_DELAY);
+}
+
 function extractText(message) {
-  if (!message) return null;
   return (
     message.conversation ||
     message.extendedTextMessage?.text ||
@@ -147,90 +228,97 @@ function extractText(message) {
   );
 }
 
-// ====================================================
-//   FORWARD TO YOUR ENDPOINT
-// ====================================================
 async function forwardMessage(number, message) {
   const url = FORWARD_URL.replace(/\/$/, '') + FORWARD_PATH;
-  const body = { number, message };
 
-  const res = await fetch(url, {
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...(OTP_TOKEN ? { 'X-Qxel-Secret-Key': OTP_TOKEN } : {})
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify({ number, message })
   });
 
-  const text = await res.text().catch(() => '');
-  if (!res.ok) {
+  const body = await response.text();
+
+  if (!response.ok) {
     logger.error(
-      { status: res.status, body: text },
+      { status: response.status, body },
       '❌ Forward failed'
     );
-  } else {
-    logger.info({ status: res.status }, '✅ Forwarded successfully');
+    return;
   }
+
+  logger.info({ status: response.status }, '✅ Forwarded successfully');
 }
 
-// ====================================================
-//   BOOT
-// ====================================================
 async function boot() {
+  if (isShuttingDown || sock) return;
+
   try {
     sock = await connectSession();
-  } catch (err) {
-    logger.error({ err }, '❌ Boot failed — retrying');
-    setTimeout(boot, RECONNECT_DELAY);
+    reconnecting = false;
+  } catch (error) {
+    sock = null;
+    reconnecting = false;
+
+    logger.error({ error }, '❌ WhatsApp boot failed');
+    scheduleReconnect();
   }
 }
 
-// ====================================================
-//   HTTP WEB SERVICE (PORT 3000)
-// ====================================================
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      service: 'whatsapp-forwarder',
-      connected: !!sock,
-      uptime: process.uptime()
-    }));
+    res.end(
+      JSON.stringify({
+        status: 'ok',
+        service: 'whatsapp-forwarder',
+        connected: Boolean(sock),
+        uptime: process.uptime()
+      })
+    );
     return;
   }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not Found' }));
 });
 
-server.listen(PORT, () => {
-  logger.info(`🌐 Web service listening on port ${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  logger.info({ port: PORT }, '🌐 Web service listening');
 });
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  logger.info('SIGINT — shutting down');
+function shutdown(signal) {
+  logger.info({ signal }, 'Shutting down');
+
   isShuttingDown = true;
-  try { sock?.end(undefined); } catch {}
-  try { server.close(); } catch {}
-  process.exit(0);
-});
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM — shutting down');
-  isShuttingDown = true;
-  try { sock?.end(undefined); } catch {}
-  try { server.close(); } catch {}
-  process.exit(0);
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  try {
+    sock?.end(undefined);
+  } catch (error) {
+    logger.error({ error }, 'Error closing WhatsApp socket');
+  }
+
+  server.close(() => process.exit(0));
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+process.on('uncaughtException', error => {
+  logger.error({ error }, 'Uncaught exception');
 });
 
-process.on('uncaughtException', (err) => {
-  logger.error({ err }, 'uncaughtException');
-});
-process.on('unhandledRejection', (err) => {
-  logger.error({ err }, 'unhandledRejection');
+process.on('unhandledRejection', error => {
+  logger.error({ error }, 'Unhandled rejection');
 });
 
-// ============ START ============
 logger.info('🚀 Starting WhatsApp forwarder...');
 boot();
