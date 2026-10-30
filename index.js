@@ -38,6 +38,7 @@ let reconnectTimer = null;
 let isShuttingDown = false;
 let reconnecting = false;
 let sessionReplaced = false;
+let bootPromise = null;
 
 function fixBuffer(value) {
   if (!value || typeof value !== 'object') return value;
@@ -82,7 +83,6 @@ function loadAuthState() {
 
   const source = raw.auth || raw;
 
-  // Supports serialized Baileys auth state.
   if (source.creds && source.keys) {
     return {
       creds: source.creds,
@@ -90,7 +90,6 @@ function loadAuthState() {
     };
   }
 
-  // Supports your existing flat CREDS format.
   const creds = {};
   const keys = {};
 
@@ -219,9 +218,11 @@ async function connectSession() {
     if (code === DisconnectReason.connectionReplaced) {
       sessionReplaced = true;
       reconnecting = false;
+
       logger.error(
         '❌ WhatsApp session was replaced by another connection. Stop the other client and restart this service.'
       );
+
       return;
     }
 
@@ -229,6 +230,7 @@ async function connectSession() {
       logger.error(
         '❌ WhatsApp logged out. Generate a new CREDS value.'
       );
+
       process.exit(1);
     }
 
@@ -242,11 +244,12 @@ async function connectSession() {
       try {
         if (!msg.message || msg.key.fromMe) continue;
 
-        const from = msg.key.remoteJid || '';
+        const from = msg.key.remoteJid || msg.key.remoteJidAlt || '';
 
         if (
           from === 'status@broadcast' ||
-          !from.endsWith('@s.whatsapp.net')
+          (!from.endsWith('@lid') &&
+            !from.endsWith('@s.whatsapp.net'))
         ) {
           continue;
         }
@@ -325,6 +328,7 @@ async function forwardMessage(number, message) {
       },
       '❌ Forward failed'
     );
+
     return;
   }
 
@@ -335,22 +339,35 @@ async function forwardMessage(number, message) {
 }
 
 async function boot() {
-  if (isShuttingDown || sessionReplaced || sock) return;
-
-  try {
-    sock = await connectSession();
-    reconnecting = false;
-  } catch (error) {
-    sock = null;
-    reconnecting = false;
-
-    logger.error(
-      { err: error },
-      '❌ WhatsApp boot failed'
-    );
-
-    scheduleReconnect();
+  if (
+    isShuttingDown ||
+    sessionReplaced ||
+    sock ||
+    bootPromise
+  ) {
+    return;
   }
+
+  bootPromise = (async () => {
+    try {
+      await connectSession();
+      reconnecting = false;
+    } catch (error) {
+      sock = null;
+      reconnecting = false;
+
+      logger.error(
+        { err: error },
+        '❌ WhatsApp boot failed'
+      );
+
+      scheduleReconnect();
+    } finally {
+      bootPromise = null;
+    }
+  })();
+
+  await bootPromise;
 }
 
 const server = http.createServer((req, res) => {
