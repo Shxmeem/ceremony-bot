@@ -4,13 +4,8 @@ import {
   makeWASocket,
   fetchLatestBaileysVersion,
   DisconnectReason,
-  useMultiFileAuthState,
-  makeCacheableSignalKeyStore,
-  Browsers,
-  isJidBroadcast,
-  isJidNewsletter
+  useMultiFileAuthState
 } from 'baileys';
-import NodeCache from '@cacheable/node-cache';
 
 const FORWARD_URL = 'https://bots.qxel.app/tg/notify/bot';
 const FORWARD_PATH = '/';
@@ -22,9 +17,6 @@ const logger = pino({ level: 'info' });
 
 let sock = null;
 let isShuttingDown = false;
-
-// Survive socket restarts
-const msgRetryCounterCache = new NodeCache();
 
 function fixBuffer(obj) {
   if (obj && typeof obj === 'object') {
@@ -45,22 +37,16 @@ function loadCredsFromEnv() {
   return raw;
 }
 
-// ====================================================
-//   READ-ONLY KEYSTORE (same as Vercel version)
-// ====================================================
 function makeKeyStore(creds) {
   return {
     get: (type, ids) => {
       return creds[type] && creds[type][ids] ? creds[type][ids] : null;
     },
-    set: () => {},   // ignore writes
+    set: () => {},
     clear: () => {}
   };
 }
 
-// ====================================================
-//   CONNECT
-// ====================================================
 async function connectSession() {
   const creds = loadCredsFromEnv();
   const keyStore = makeKeyStore(creds);
@@ -78,30 +64,12 @@ async function connectSession() {
     },
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: Browsers.macOS('Chrome'),
-
-    // ==== HANDSHAKE / 408 FIXES ====
-    markOnlineOnConnect: false,        // don't force foreground → avoids extra handshake
-    syncFullHistory: false,            // prevent 408 during initial history sync
-    shouldIgnoreJid: (jid) => isJidBroadcast(jid) || isJidNewsletter(jid),
-
-    msgRetryCounterCache,              // prevents retry-loop stalls
-    maxMsgRetryCount: 5,
-
-    // reliability callbacks Baileys needs during handshake
-    getMessage: async (key) => {
-      // No persistent store; return undefined so Baileys just asks the peer to resend
-      return undefined;
-    },
-
-    // keep ws alive
+    browser: ['Izumie Console', 'Chrome', '1.0.0'],
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
     retryRequestDelayMs: 2000
   });
 
-  // ===== Connection lifecycle =====
   socket.ev.on('connection.update', ({ connection, lastDisconnect }) => {
     if (connection === 'open') {
       logger.info('✅ WhatsApp connected');
@@ -121,7 +89,6 @@ async function connectSession() {
     }
   });
 
-  // ===== Incoming messages =====
   socket.ev.on('messages.upsert', async (upsert) => {
     if (upsert.type !== 'notify') return;
 
@@ -150,9 +117,6 @@ async function connectSession() {
   return socket;
 }
 
-// ====================================================
-//   EXTRACT TEXT
-// ====================================================
 function extractText(message) {
   if (!message) return null;
   return (
@@ -170,9 +134,6 @@ function extractText(message) {
   );
 }
 
-// ====================================================
-//   FORWARD
-// ====================================================
 async function forwardMessage(number, message) {
   const url = FORWARD_URL.replace(/\/$/, '') + FORWARD_PATH;
   const body = { number, message };
@@ -194,9 +155,6 @@ async function forwardMessage(number, message) {
   }
 }
 
-// ====================================================
-//   BOOT
-// ====================================================
 async function boot() {
   try {
     sock = await connectSession();
@@ -206,9 +164,6 @@ async function boot() {
   }
 }
 
-// ====================================================
-//   HTTP WEB SERVICE
-// ====================================================
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -228,7 +183,17 @@ server.listen(PORT, () => {
   logger.info(`🌐 Web service listening on port ${PORT}`);
 });
 
-// Graceful shutdown
+// ============ START ============
+// Delay the first WhatsApp handshake so Render's container networking
+// is fully settled before we open the WebSocket. Render's proxy tears
+// down WS connections that are opened during the "starting" phase,
+// which WhatsApp surfaces as a 408 handshake failure.
+logger.info('🚀 Starting WhatsApp forwarder...');
+setTimeout(() => {
+  logger.info('🔌 Opening WhatsApp session...');
+  boot();
+}, 20000);
+
 process.on('SIGINT', () => {
   logger.info('SIGINT — shutting down');
   isShuttingDown = true;
@@ -246,6 +211,3 @@ process.on('SIGTERM', () => {
 
 process.on('uncaughtException', (err) => logger.error({ err }, 'uncaughtException'));
 process.on('unhandledRejection', (err) => logger.error({ err }, 'unhandledRejection'));
-
-logger.info('🚀 Starting WhatsApp forwarder...');
-boot();
