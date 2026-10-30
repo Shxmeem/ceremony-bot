@@ -4,7 +4,7 @@
   "type": "module",
   "dependencies": {
     "dotenv": "^18.0.9",
-    "baileys": "7.0.0-rc.2",
+    "baileys": "7.0.0-rc12",
     "pino": "^10.4.0"
   }
 }
