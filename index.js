@@ -1,9 +1,12 @@
 import pino from 'pino';
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 import {
   makeWASocket,
   fetchLatestBaileysVersion,
   DisconnectReason,
+  useMultiFileAuthState,
   initAuthCreds
 } from 'baileys';
 
@@ -12,6 +15,7 @@ const FORWARD_PATH = '/';
 const OTP_TOKEN = process.env.OTP_TOKEN || '';
 const RECONNECT_DELAY = 5000;
 const PORT = process.env.PORT || 3000;
+const AUTH_DIR = process.env.AUTH_DIR || './auth';
 
 const logger = pino({ level: 'info' });
 
@@ -28,39 +32,32 @@ function fixBuffer(obj) {
   return obj;
 }
 
-function loadCredsFromEnv() {
-  if (!process.env.CREDS) {
-    logger.warn('CREDS env var not found, using fresh initAuthCreds()');
-    return initAuthCreds();
+// Seed auth folder from CREDS env var ONCE (if folder is empty)
+function seedAuthFromEnv() {
+  if (!process.env.CREDS) return;
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+  const credsFile = path.join(AUTH_DIR, 'creds.json');
+  if (fs.existsSync(credsFile)) {
+    logger.info('Auth folder already exists — skipping CREDS seed');
+    return;
   }
-  const raw = fixBuffer(JSON.parse(process.env.CREDS));
-  return raw;
-}
 
-// ====================================================
-//   PERSISTENT IN-MEMORY KEYSTORE
-//   - created ONCE so it survives reconnects
-//   - creds.update writes are kept in memory
-// ====================================================
-const creds = loadCredsFromEnv();
-const keyStore = {};
+  try {
+    const raw = fixBuffer(JSON.parse(process.env.CREDS));
 
-function keysGet(type, ids) {
-  if (Array.isArray(ids)) {
-    const result = {};
-    for (const id of ids) {
-      if (keyStore[type] && keyStore[type][id]) result[id] = keyStore[type][id];
+    // Baileys >= 6 stores creds as JSON with buffers serialized as
+    // { type: 'Buffer', data: [...] }. JSON.stringify already handles this.
+    // Also strip the pairing keypair if the device is already registered.
+    if (raw.registered && raw.pairingEphemeralKeyPair) {
+      delete raw.pairingEphemeralKeyPair;
+      delete raw.pairingCode;
     }
-    return result;
-  }
-  return keyStore[type] && keyStore[type][ids] ? keyStore[type][ids] : null;
-}
 
-function keysSet(data) {
-  if (!data) return;
-  for (const type in data) {
-    if (!keyStore[type]) keyStore[type] = {};
-    Object.assign(keyStore[type], data[type]);
+    fs.writeFileSync(credsFile, JSON.stringify(raw, null, 2));
+    logger.info('Seeded creds.json from CREDS env var');
+  } catch (e) {
+    logger.error({ err: e }, 'Failed to seed creds from CREDS');
   }
 }
 
@@ -68,18 +65,17 @@ function keysSet(data) {
 //   CONNECT
 // ====================================================
 async function connectSession() {
+  seedAuthFromEnv();
+
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
   const socket = makeWASocket({
     version,
     auth: {
-      creds,
-      keys: {
-        get: keysGet,
-        set: keysSet
-      }
+      creds: state.creds,
+      keys: state.keys
     },
-    printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
     browser: ['Izumie Console', 'Chrome', '1.0.0'],
     markOnlineOnConnect: false,
@@ -87,17 +83,12 @@ async function connectSession() {
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 60000,
     retryRequestDelayMs: 2000,
-    // Baileys needs this to answer "retry receipt" requests from WhatsApp.
-    // We don't store messages; returning empty string is fine.
     getMessage: async () => ''
   });
 
-  // Persist updated creds (noise keys, registrationId, etc.) in memory.
-  socket.ev.on('creds.update', (update) => {
-    Object.assign(creds, update);
-  });
+  // IMPORTANT: persist every creds/key mutation to disk
+  socket.ev.on('creds.update', saveCreds);
 
-  // ===== Connection lifecycle =====
   socket.ev.on('connection.update', ({ connection, lastDisconnect }) => {
     if (connection === 'open') {
       logger.info('✅ WhatsApp connected');
@@ -109,7 +100,7 @@ async function connectSession() {
       if (isShuttingDown) return;
 
       if (code === DisconnectReason.loggedOut) {
-        logger.error('❌ Logged out — CREDS need to be regenerated.');
+        logger.error('❌ Logged out — delete ./auth and provide new CREDS.');
         process.exit(1);
       }
 
@@ -118,7 +109,6 @@ async function connectSession() {
     }
   });
 
-  // ===== Incoming messages =====
   socket.ev.on('messages.upsert', async (upsert) => {
     if (upsert.type !== 'notify') return;
 
@@ -147,9 +137,6 @@ async function connectSession() {
   return socket;
 }
 
-// ====================================================
-//   EXTRACT TEXT FROM ANY MESSAGE TYPE
-// ====================================================
 function extractText(message) {
   if (!message) return null;
   return (
@@ -167,9 +154,6 @@ function extractText(message) {
   );
 }
 
-// ====================================================
-//   FORWARD TO YOUR ENDPOINT
-// ====================================================
 async function forwardMessage(number, message) {
   const url = FORWARD_URL.replace(/\/$/, '') + FORWARD_PATH;
   const body = { number, message };
@@ -191,9 +175,6 @@ async function forwardMessage(number, message) {
   }
 }
 
-// ====================================================
-//   BOOT
-// ====================================================
 async function boot() {
   try {
     sock = await connectSession();
@@ -203,9 +184,6 @@ async function boot() {
   }
 }
 
-// ====================================================
-//   HTTP WEB SERVICE
-// ====================================================
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -225,7 +203,6 @@ server.listen(PORT, () => {
   logger.info(`🌐 Web service listening on port ${PORT}`);
 });
 
-// Graceful shutdown
 process.on('SIGINT', () => {
   logger.info('SIGINT — shutting down');
   isShuttingDown = true;
@@ -248,6 +225,5 @@ process.on('unhandledRejection', (err) => {
   logger.error({ err }, 'unhandledRejection');
 });
 
-// ============ START ============
 logger.info('🚀 Starting WhatsApp forwarder...');
 boot();
