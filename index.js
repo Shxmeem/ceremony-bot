@@ -6,8 +6,7 @@ import {
   DisconnectReason
 } from 'baileys';
 
-const FORWARD_URL = 'https://bots.qxel.app';
-const FORWARD_PATH = '/tg/notify/bot';
+const FORWARD_URL = process.env.FORWARD_URL || 'https://bots.qxel.app/tg/notify/bot';
 const OTP_TOKEN = process.env.OTP_TOKEN || '';
 const PORT = Number(process.env.PORT || 10000);
 const RECONNECT_DELAY = 5000;
@@ -307,7 +306,7 @@ function extractText(message) {
 }
 
 async function forwardMessage(number, message) {
-  const url = FORWARD_URL.replace(/\/$/, '') + FORWARD_PATH;
+  const url = FORWARD_URL;
 
   const response = await fetch(url, {
     method: 'POST',
