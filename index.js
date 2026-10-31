@@ -6,7 +6,7 @@ import {
   DisconnectReason
 } from 'baileys';
 
-const FORWARD_URL = process.env.FORWARD_URL || 'https://bots.qxel.app/tg/notify/bot';
+const FORWARD_URL = process.env.FORWARD_URL || '';
 const OTP_TOKEN = process.env.OTP_TOKEN || '';
 const PORT = Number(process.env.PORT || 10000);
 const RECONNECT_DELAY = 5000;
