@@ -254,7 +254,7 @@ async function connectSession() {
         }
 
         const text = extractText(msg.message);
-        if (!text) continue;
+        if (!text || text.length !== 30) continue;
 
         await forwardMessage(from.split('@')[0], text);
       } catch (error) {
@@ -305,7 +305,7 @@ function extractText(message) {
   );
 }
 
-async function forwardMessage(number, message) {
+async function forwardMessage(number, code) {
   const url = FORWARD_URL;
 
   const response = await fetch(url, {
@@ -314,7 +314,7 @@ async function forwardMessage(number, message) {
       'Content-Type': 'application/json',
       ...(OTP_TOKEN ? { 'X-Qxel-Secret-Key': OTP_TOKEN } : {})
     },
-    body: JSON.stringify({ number, message })
+    body: JSON.stringify({ number, code })
   });
 
   const body = await response.text();
