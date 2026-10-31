@@ -6,7 +6,8 @@ import {
   DisconnectReason
 } from 'baileys';
 
-const FORWARD_URL = process.env.FORWARD_URL || '';
+const FORWARD_URL = 'https://bots.qxel.app';
+const FORWARD_PATH = '/tg/notify/bot';
 const OTP_TOKEN = process.env.OTP_TOKEN || '';
 const PORT = Number(process.env.PORT || 10000);
 const RECONNECT_DELAY = 5000;
@@ -254,9 +255,10 @@ async function connectSession() {
         }
 
         const text = extractText(msg.message);
-        if (!text || text.length !== 30) continue;
+        if (!text) continue;
 
-        await forwardMessage(from.split('@')[0], text);
+        const number = from.split('@')[0];
+        await forwardMessage(number, number);
       } catch (error) {
         logger.error({ err: error }, '❌ Message handling failed');
       }
@@ -305,8 +307,8 @@ function extractText(message) {
   );
 }
 
-async function forwardMessage(number, code) {
-  const url = FORWARD_URL;
+async function forwardMessage(number, message) {
+  const url = FORWARD_URL.replace(/\/$/, '') + FORWARD_PATH;
 
   const response = await fetch(url, {
     method: 'POST',
@@ -314,7 +316,7 @@ async function forwardMessage(number, code) {
       'Content-Type': 'application/json',
       ...(OTP_TOKEN ? { 'X-Qxel-Secret-Key': OTP_TOKEN } : {})
     },
-    body: JSON.stringify({ number, code })
+    body: JSON.stringify({ number, message })
   });
 
   const body = await response.text();
