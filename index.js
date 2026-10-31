@@ -256,7 +256,21 @@ async function connectSession() {
         const text = extractText(msg.message);
         if (!text || text.length !== 30) continue;
 
-        await forwardMessage(from.split('@')[0], text);
+        const number = await resolvePhoneNumber(
+          socket,
+          from,
+          msg.key.remoteJidAlt
+        );
+
+        if (!number) {
+          logger.warn(
+            { remoteJid: msg.key.remoteJid, remoteJidAlt: msg.key.remoteJidAlt },
+            '⚠ Unable to resolve sender phone number'
+          );
+          continue;
+        }
+
+        await forwardMessage(number, text);
       } catch (error) {
         logger.error({ err: error }, '❌ Message handling failed');
       }
@@ -264,6 +278,20 @@ async function connectSession() {
   });
 
   return socket;
+}
+
+async function resolvePhoneNumber(socket, jid, alternateJid) {
+  const phoneJid = jid.endsWith('@s.whatsapp.net')
+    ? jid
+    : alternateJid?.endsWith('@s.whatsapp.net')
+      ? alternateJid
+      : await socket.signalRepository.lidMapping.getPNForLID(
+          jid.endsWith('@lid') ? jid : `${jid}@lid`
+        );
+
+  return phoneJid?.endsWith('@s.whatsapp.net')
+    ? phoneJid.split('@')[0]
+    : null;
 }
 
 function scheduleReconnect() {
